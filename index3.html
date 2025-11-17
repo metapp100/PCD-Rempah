@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Deteksi Rempah Real-time (TF.js)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+    <style>
+      /* (CSS tidak berubah) */
+      #webcam {
+        position: absolute;
+        top: -9999px;
+        left: -9999px;
+        width: 1px;
+        height: 1px;
+        z-index: 9;
+      }
+      #container {
+        position: relative;
+        aspect-ratio: 16 / 9;
+        background-color: #333;
+        width: 100%;
+        border-radius: 0.5rem;
+        overflow: hidden;
+      }
+      #canvasOutput {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 10;
+      }
+    </style>
+  </head>
+  <body
+    class="bg-gray-900 text-white min-h-screen flex items-center justify-center font-sans"
+  >
+    <div class="container mx-auto p-4 max-w-3xl text-center">
+      <h1 class="text-3xl font-bold mb-4">
+        🌿 Deteksi Rempah Real-time (TF.js)
+      </h1>
+      <p class="text-gray-400 mb-4">
+        Model berjalan 100% di browser Anda menggunakan GPU. Performa akan cepat
+        dan real-time.
+      </p>
+
+      <div
+        id="container"
+        class="relative w-full max-w-2xl mx-auto rounded-lg overflow-hidden shadow-xl"
+      >
+        <canvas id="canvasOutput" class="w-full h-auto"></canvas>
+        <video
+          id="webcam"
+          playsinline
+          muted
+          autoplay
+          class="w-full h-auto"
+        ></video>
+      </div>
+
+      <button
+        id="startButton"
+        class="mt-6 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-lg text-lg transition duration-300"
+      >
+        Mulai Kamera
+      </button>
+
+      <div id="loadingStatus" class="mt-4 text-lg">
+        Memuat model... (ini mungkin butuh beberapa detik)
+      </div>
+    </div>
+
+    <script>
+      // --- 1. PENGATURAN & KONSTANTA ---
+
+      const NAMA_KELAS = [
+        "Biji Ketumbar",
+        "Daun Jeruk",
+        "Daun Salam",
+        "Jahe",
+        "Jinten",
+        "Kemiri",
+        "Kencur",
+        "Kunyit",
+        "Lada",
+        "Lengkuas",
+        "Pala",
+        "Serai",
+      ];
+
+      const MODEL_INPUT_SIZE = 640;
+      const CONFIDENCE_THRESHOLD = 0.3; // Tetap 0.3 (30%)
+      const IOU_THRESHOLD = 0.5;
+      const MODEL_PATH = "/best_web_model/model.json";
+
+      const video = document.getElementById("webcam");
+      const canvas = document.getElementById("canvasOutput");
+      const ctx = canvas.getContext("2d");
+      const startButton = document.getElementById("startButton");
+      const loadingStatus = document.getElementById("loadingStatus");
+
+      let model;
+      let isWebcamActive = false;
+      let animationFrameId;
+      let inferenceTimeoutId; // Untuk setTimeout inferensi
+      let frameCount = 0;
+      const INFERENCE_INTERVAL = 1; // Kurangi ke 5 untuk lebih sering (lebih responsif)
+      let lastDetections = [];
+      let isInferring = false; // Flag untuk mencegah inferensi bertumpuk
+
+      // --- 2. FUNGSI UTAMA ---
+
+      async function loadModel() {
+        console.log("Memulai memuat model...");
+        try {
+          model = await tf.loadGraphModel(MODEL_PATH);
+          const warmUpTensor = tf.zeros([
+            1,
+            MODEL_INPUT_SIZE,
+            MODEL_INPUT_SIZE,
+            3,
+          ]);
+          await model.executeAsync(warmUpTensor);
+          tf.dispose(warmUpTensor);
+          console.log("Model berhasil dimuat dan 'dipanaskan'.");
+          loadingStatus.innerText = "Model Siap! Klik 'Mulai Kamera'.";
+          startButton.disabled = false;
+        } catch (err) {
+          console.error("Gagal memuat model:", err);
+          loadingStatus.innerText = "Error: Gagal memuat model.";
+        }
+      }
+
+      function detectLoop() {
+        if (!isWebcamActive) return;
+
+        if (
+          canvas.width !== video.videoWidth ||
+          canvas.height !== video.videoHeight
+        ) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+        }
+
+        // Selalu gambar video setiap frame
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // Gambar deteksi terakhir setiap frame
+        drawDetections(lastDetections);
+
+        frameCount++;
+
+        // Jalankan inferensi di setTimeout terpisah (bukan di requestAnimationFrame)
+        if (frameCount % INFERENCE_INTERVAL === 0 && !isInferring) {
+          isInferring = true;
+          inferenceTimeoutId = setTimeout(async () => {
+            await runInference();
+            isInferring = false;
+          }, 0); // Jalankan segera di next tick
+        }
+
+        animationFrameId = requestAnimationFrame(detectLoop);
+      }
+
+      async function runInference() {
+        // ==========================================================
+        // == PERBAIKAN: Tambahkan .div(255.0) untuk NORMALISASI ==
+        // ==========================================================
+        const inputTensor = tf.browser
+          .fromPixels(video)
+          .resizeBilinear([MODEL_INPUT_SIZE, MODEL_INPUT_SIZE])
+          .cast("float32")
+          .div(255.0) // <-- INI PERBAIKANNYA (Mengubah 0-255 menjadi 0.0-1.0)
+          .expandDims(0);
+        // ==========================================================
+
+        const outputTensor = model.execute(inputTensor);
+        const transposedOutput = outputTensor.transpose([0, 2, 1]);
+
+        // Update lastDetections
+        lastDetections = await processOutput(transposedOutput);
+
+        tf.dispose([inputTensor, outputTensor]);
+      }
+
+      async function processOutput(transposedOutput) {
+        const numBoxes = transposedOutput.shape[1];
+        const numClasses = NAMA_KELAS.length;
+
+        const outputData = await transposedOutput.data();
+        tf.dispose(transposedOutput);
+
+        let boxes = [];
+        let scores = [];
+        let classIndices = [];
+
+        // ==========================================================
+        // == DEBUG: Tambahkan ini untuk melihat skor mentah di konsol ==
+        // ==========================================================
+        let frameMaxScore = 0; // Lacak skor tertinggi di frame ini
+        // ==========================================================
+
+        for (let i = 0; i < numBoxes; i++) {
+          const offset = i * (4 + numClasses);
+          const classScores = outputData.slice(
+            offset + 4,
+            offset + 4 + numClasses
+          );
+
+          let maxScore = 0;
+          let maxClassIndex = -1;
+          for (let j = 0; j < numClasses; j++) {
+            if (classScores[j] > maxScore) {
+              maxScore = classScores[j];
+              maxClassIndex = j;
+            }
+          }
+
+          // ==========================================================
+          // == DEBUG: (Lanjutan) ==
+          // ==========================================================
+          if (maxScore > frameMaxScore) {
+            frameMaxScore = maxScore;
+          }
+          // ==========================================================
+
+          if (maxScore > CONFIDENCE_THRESHOLD) {
+            const cx = outputData[offset];
+            const cy = outputData[offset + 1];
+            const w = outputData[offset + 2];
+            const h = outputData[offset + 3];
+            const y1 = (cy - h / 2) / MODEL_INPUT_SIZE;
+            const x1 = (cx - w / 2) / MODEL_INPUT_SIZE;
+            const y2 = (cy + h / 2) / MODEL_INPUT_SIZE;
+            const x2 = (cx + w / 2) / MODEL_INPUT_SIZE;
+            boxes.push([y1, x1, y2, x2]);
+            scores.push(maxScore);
+            classIndices.push(maxClassIndex);
+          }
+        }
+
+        // ==========================================================
+        // == DEBUG: (Lanjutan) Cetak skor tertinggi ke konsol ==
+        // ==========================================================
+        console.log("Skor Tertinggi Frame Ini:", frameMaxScore);
+        // ==========================================================
+
+        if (boxes.length === 0) {
+          return [];
+        }
+
+        const boxTensors = tf.tensor2d(boxes);
+        const scoreTensors = tf.tensor1d(scores);
+
+        const selectedIndices = await tf.image.nonMaxSuppressionAsync(
+          boxTensors,
+          scoreTensors,
+          100,
+          IOU_THRESHOLD,
+          CONFIDENCE_THRESHOLD
+        );
+
+        const selectedIndicesData = await selectedIndices.data();
+
+        const finalBoxes = [];
+        for (let i = 0; i < selectedIndicesData.length; i++) {
+          const index = selectedIndicesData[i];
+          finalBoxes.push({
+            box: boxes[index],
+            score: scores[index],
+            classIndex: classIndices[index],
+          });
+        }
+
+        tf.dispose([boxTensors, scoreTensors, selectedIndices]);
+
+        return finalBoxes;
+      }
+
+      function drawDetections(boxes) {
+        boxes.forEach((boxData) => {
+          const [y1_norm, x1_norm, y2_norm, x2_norm] = boxData.box;
+          const score = boxData.score;
+          const classIndex = boxData.classIndex;
+          const label = NAMA_KELAS[classIndex];
+
+          const x = x1_norm * canvas.width;
+          const y = y1_norm * canvas.height;
+          const w = (x2_norm - x1_norm) * canvas.width;
+          const h = (y2_norm - y1_norm) * canvas.height;
+
+          ctx.strokeStyle = "#00FFFF";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x, y, w, h);
+
+          ctx.fillStyle = "#00FFFF";
+          ctx.font = "18px Arial";
+          const text = `${label} (${(score * 100).toFixed(1)}%)`;
+          const textWidth = ctx.measureText(text).width;
+
+          ctx.fillRect(x, y, textWidth + 8, 24);
+          ctx.fillStyle = "#000000";
+          ctx.fillText(text, x + 4, y + 18);
+        });
+      }
+
+      async function toggleWebcam() {
+        if (isWebcamActive) {
+          isWebcamActive = false;
+          cancelAnimationFrame(animationFrameId);
+          clearTimeout(inferenceTimeoutId); // Hentikan inferensi
+          const tracks = video.srcObject.getTracks();
+          tracks.forEach((track) => track.stop());
+          video.srcObject = null;
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          startButton.innerText = "Mulai Kamera";
+          lastDetections = [];
+          frameCount = 0;
+          isInferring = false;
+        } else {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: { facingMode: "environment", width: 640, height: 480 }, // Resolusi lebih rendah untuk smooth
+              audio: false,
+            });
+            video.srcObject = stream;
+
+            video.onloadedmetadata = async () => {
+              try {
+                await video.play();
+                isWebcamActive = true;
+                startButton.innerText = "Hentikan Kamera";
+                detectLoop();
+              } catch (playErr) {
+                console.error("Error saat video.play(): ", playErr);
+              }
+            };
+          } catch (err) {
+            console.error("Error mengakses webcam:", err);
+            alert("Gagal mengakses webcam. Pastikan Anda memberi izin.");
+          }
+        }
+      }
+
+      // --- 3. EVENT LISTENERS ---
+      startButton.disabled = true;
+      startButton.addEventListener("click", toggleWebcam);
+      loadModel();
+    </script>
+  </body>
+</html>
